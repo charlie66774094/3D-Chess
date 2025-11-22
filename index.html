@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>3D 国际象棋 - 增强版</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: 'Segoe UI', sans-serif; }
+        
+        /* UI 层 */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; display: flex; flex-direction: column; justify-content: space-between;
+        }
+        
+        /* 顶部状态栏 */
+        #header {
+            padding: 20px; text-align: center;
+        }
+        #status-pill {
+            background: rgba(0, 0, 0, 0.8); color: white;
+            padding: 10px 25px; border-radius: 50px;
+            font-size: 18px; font-weight: bold;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            display: inline-block;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s;
+        }
+        
+        /* 游戏结束弹窗 */
+        #game-over-modal {
+            display: none; pointer-events: auto;
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(20, 20, 20, 0.95);
+            border: 2px solid #gold;
+            padding: 40px; border-radius: 15px;
+            text-align: center; color: white;
+            box-shadow: 0 0 50px rgba(255, 215, 0, 0.3);
+            min-width: 300px;
+        }
+        #game-over-title { font-size: 32px; margin-bottom: 10px; color: #ffd700; }
+        #game-over-desc { font-size: 18px; margin-bottom: 30px; color: #ccc; }
+        button {
+            background: #ffd700; color: #000; border: none;
+            padding: 12px 30px; font-size: 16px; font-weight: bold;
+            border-radius: 8px; cursor: pointer; transition: 0.2s;
+        }
+        button:hover { transform: scale(1.05); background: #ffed4a; }
+
+        /* 底部操作栏 */
+        #footer { padding: 20px; text-align: center; pointer-events: auto; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+</head>
+<body>
+
+<div id="ui-layer">
+    <div id="header">
+        <div id="status-pill">准备开始</div>
+    </div>
+    
+    <div id="game-over-modal">
+        <div id="game-over-title">CHECKMATE</div>
+        <div id="game-over-desc">白方获胜</div>
+        <button onclick="resetGame()">再来一局</button>
+    </div>
+
+    <div id="footer">
+        <button onclick="undoMove()" style="background:#444; color:#fff;">悔棋</button>
+        <button onclick="resetGame()" style="background:#444; color:#fff; margin-left:10px;">重置</button>
+    </div>
+</div>
+
+<script>
+    // --- 音效系统 (使用简单的合成音，无需加载外部文件) ---
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playSound(type) {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        if (type === 'move') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(300, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.1);
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+        } else if (type === 'capture') {
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.15);
+            gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+        } else if (type === 'check') {
+            osc.type = 'sawtooth'; // 刺耳一点
+            osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+            osc.frequency.linearRampToValueAtTime(300, audioCtx.currentTime + 0.3);
+            gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+        } else if (type === 'win') {
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+            osc.frequency.setValueAtTime(554, audioCtx.currentTime + 0.1);
+            osc.frequency.setValueAtTime(659, audioCtx.currentTime + 0.2);
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.6);
+            osc.start(); osc.stop(audioCtx.currentTime + 0.6);
+        }
+    }
+
+    // --- 1. Three.js 初始化 ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1e1e1e);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 10, 10);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.maxPolarAngle = Math.PI / 2.1;
+
+    // --- 2. 灯光 ---
+    scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+    
+    const mainLight = new THREE.DirectionalLight(0xffffff, 1);
+    mainLight.position.set(5, 10, 5);
+    mainLight.castShadow = true;
+    mainLight.shadow.mapSize.width = 2048;
+    mainLight.shadow.mapSize.height = 2048;
+    scene.add(mainLight);
+
+    // 增加侧光让质感更好
+    const sideLight = new THREE.PointLight(0x3366ff, 0.5);
+    sideLight.position.set(-5, 5, -5);
+    scene.add(sideLight);
+
+    // --- 3. 材质定义 ---
+    const matWhite = new THREE.MeshStandardMaterial({ color: 0xeeeeee, roughness: 0.1, metalness: 0.1 });
+    const matBlack = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.1, metalness: 0.6 }); // 黑棋有点金属感
+    const matBoardWhite = new THREE.MeshStandardMaterial({ color: 0xD2B48C, roughness: 0.5 });
+    const matBoardBlack = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.5 });
+    const matSelected = new THREE.MeshStandardMaterial({ color: 0x4CAF50, transparent: true, opacity: 0.6 }); // 绿色选中
+    const matPossible = new THREE.MeshStandardMaterial({ color: 0xffff00, transparent: true, opacity: 0.4 }); // 黄色可行
+    const matCheck = new THREE.MeshStandardMaterial({ color: 0xff0000, emissive: 0xaa0000, emissiveIntensity: 0.5 }); // 红色将军/将死
+
+    // --- 4. 逻辑初始化 ---
+    const chess = new Chess();
+    const squaresMap = {}; // 映射 "e2" -> Mesh
+    const piecesMap = {};  // 映射 "e2" -> Piece Group
+    let selectedSquare = null;
+    let possibleMoves = [];
+
+    // --- 5. 构建场景 ---
+    const boardGroup = new THREE.Group();
+    scene.add(boardGroup);
+
+    // 棋盘
+    function initBoard() {
+        const geo = new THREE.BoxGeometry(1, 0.2, 1);
+        for(let x=0; x<8; x++) {
+            for(let z=0; z<8; z++) {
+                const isWhite = (x+z)%2 === 0;
+                const sqName = String.fromCharCode(97+x) + (8-z);
+                const mesh = new THREE.Mesh(geo, isWhite ? matBoardWhite : matBoardBlack);
+                mesh.position.set(x-3.5, -0.1, z-3.5);
+                mesh.receiveShadow = true;
+                mesh.userData = { isSquare: true, sqName: sqName };
+                boardGroup.add(mesh);
+                squaresMap[sqName] = mesh;
+                
+                // 坐标提示 (可选，这里略过简化)
+            }
+        }
+        // 边框
+        const border = new THREE.Mesh(new THREE.BoxGeometry(8.4, 0.1, 8.4), new THREE.MeshStandardMaterial({color: 0x333333}));
+        border.position.y = -0.25;
+        border.receiveShadow = true;
+        boardGroup.add(border);
+    }
+    initBoard();
+
+    // 棋子生成 (复用之前的几何体逻辑，稍微优化)
+    function createPiece(type, color) {
+        const group = new THREE.Group();
+        const mat = color === 'w' ? matWhite : matBlack;
+        
+        // 通用底座
+        const base = new THREE.Mesh(new THREE.CylinderGeometry(0.35, 0.4, 0.15, 32), mat);
+        base.position.y = 0.075;
+        base.castShadow = true; base.receiveShadow = true;
+        group.add(base);
+
+        let geo;
+        let yOff = 0;
+
+        switch(type) {
+            case 'p': 
+                geo = new THREE.SphereGeometry(0.25, 16, 16); yOff=0.5; break;
+            case 'r': 
+                geo = new THREE.BoxGeometry(0.4, 0.6, 0.4); yOff=0.45; break;
+            case 'n': 
+                geo = new THREE.CylinderGeometry(0.2, 0.3, 0.6, 4); yOff=0.45; break; // 马用棱柱代替
+            case 'b': 
+                geo = new THREE.ConeGeometry(0.25, 0.8, 16); yOff=0.55; break;
+            case 'q': 
+                geo = new THREE.CylinderGeometry(0.3, 0.2, 0.9, 16); yOff=0.6; break;
+            case 'k': 
+                geo = new THREE.CylinderGeometry(0.25, 0.25, 1.0, 8); yOff=0.65; 
+                // 十字架
+                const cross = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.3, 0.15), mat);
+                cross.position.y = 1.2; 
+                group.add(cross);
+                break;
+        }
+        const body = new THREE.Mesh(geo, mat);
+        body.position.y = yOff;
+        body.castShadow = true; body.receiveShadow = true;
+        group.add(body);
+        
+        // 旋转马和象让它们朝向好看点
+        if(type === 'n') group.rotation.y = color === 'w' ? -Math.PI/2 : Math.PI/2;
+
+        return group;
+    }
+
+    function updateBoard() {
+        // 清理旧棋子
+        for (let k in piecesMap) {
+            scene.remove(piecesMap[k]);
+        }
+        // 清空对象
+        for (let key in piecesMap) delete piecesMap[key];
+
+        // 重绘
+        const board = chess.board();
+        board.forEach((row, rIdx) => {
+            row.forEach((p, cIdx) => {
+                if (p) {
+                    const sqName = String.fromCharCode(97+cIdx) + (8-rIdx);
+                    const pieceObj = createPiece(p.type, p.color);
+                    pieceObj.position.set(cIdx-3.5, 0, rIdx-3.5);
+                    
+                    // 如果是国王且被将军，变红！
+                    if (p.type === 'k' && chess.in_check() && p.color === chess.turn()) {
+                        pieceObj.children.forEach(c => c.material = matCheck);
+                    }
+
+                    scene.add(pieceObj);
+                    piecesMap[sqName] = pieceObj;
+                }
+            });
+        });
+    }
+    
+    // 初始化第一次渲染
+    updateBoard();
+    updateStatusUI();
+
+    // --- 6. 交互逻辑 ---
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function resetHighlights() {
+        for (let sq in squaresMap) {
+            const x = sq.charCodeAt(0) - 97;
+            const z = 8 - parseInt(sq[1]);
+            const isWhite = (x+z)%2===0;
+            squaresMap[sq].material = isWhite ? matBoardWhite : matBoardBlack;
+        }
+    }
+
+    function onInteract(event) {
+        if (chess.game_over()) return;
+
+        // 获取坐标
+        let clientX, clientY;
+        if (event.changedTouches) {
+            clientX = event.changedTouches[0].clientX;
+            clientY = event.changedTouches[0].clientY;
+        } else {
+            clientX = event.clientX;
+            clientY = event.clientY;
+        }
+        mouse.x = (clientX / window.innerWidth) * 2 - 1;
+        mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(boardGroup.children);
+
+        if (intersects.length > 0) {
+            const obj = intersects[0].object;
+            if (obj.userData.isSquare) {
+                handleSquareClick(obj.userData.sqName);
+            }
+        }
+    }
+
+    function handleSquareClick(sq) {
+        // 1. 如果之前选中了棋子，尝试移动到这里
+        if (selectedSquare) {
+            // 尝试移动
+            const move = chess.move({ from: selectedSquare, to: sq, promotion: 'q' });
+            
+            if (move) {
+                // --- 移动成功 ---
+                selectedSquare = null;
+                resetHighlights();
+                updateBoard();
+                updateStatusUI();
+                
+                // 播放音效
+                if (chess.game_over()) playSound('win');
+                else if (chess.in_check()) playSound('check');
+                else if (move.captured) playSound('capture');
+                else playSound('move');
+
+                return;
+            }
+        }
+
+        // 2. 如果没移动成功（或者是新点击），检查是否是选中己方棋子
+        const piece = chess.get(sq);
+        if (piece && piece.color === chess.turn()) {
+            selectedSquare = sq;
+            resetHighlights();
+            
+            // 高亮自己
+            squaresMap[sq].material = matSelected;
+            
+            // 高亮可行步数
+            const moves = chess.moves({ square: sq, verbose: true });
+            moves.forEach(m => {
+                if(squaresMap[m.to]) squaresMap[m.to].material = matPossible;
+            });
+        } else {
+            // 点了空地或敌方棋子，取消选择
+            selectedSquare = null;
+            resetHighlights();
+        }
+    }
+
+    function updateStatusUI() {
+        const statusDiv = document.getElementById('status-pill');
+        const modal = document.getElementById('game-over-modal');
+        const title = document.getElementById('game-over-title');
+        const desc = document.getElementById('game-over-desc');
+
+        if (chess.in_checkmate()) {
+            const winner = chess.turn() === 'w' ? '黑方' : '白方';
+            statusDiv.innerText = `${winner} 获胜!`;
+            statusDiv.style.background = "#d32f2f";
+            
+            // 弹窗
+            modal.style.display = 'block';
+            title.innerText = "胜负已分";
+            desc.innerText = `将军无解！${winner} 赢了。`;
+            
+        } else if (chess.in_draw()) {
+            statusDiv.innerText = "和局";
+            modal.style.display = 'block';
+            title.innerText = "和局";
+            desc.innerText = "双方握手言和";
+        } else {
+            // 游戏中
+            modal.style.display = 'none';
+            const turnName = chess.turn() === 'w' ? "白方" : "黑方";
+            if (chess.in_check()) {
+                statusDiv.innerText = `${turnName} 被将军!`;
+                statusDiv.style.background = "#f57c00"; // 橙色警告
+            } else {
+                statusDiv.innerText = `轮到 ${turnName} 走棋`;
+                statusDiv.style.background = "rgba(0, 0, 0, 0.8)";
+            }
+        }
+    }
+
+    window.undoMove = function() {
+        chess.undo();
+        selectedSquare = null;
+        resetHighlights();
+        updateBoard();
+        updateStatusUI();
+        document.getElementById('game-over-modal').style.display = 'none';
+    }
+
+    window.resetGame = function() {
+        chess.reset();
+        selectedSquare = null;
+        resetHighlights();
+        updateBoard();
+        updateStatusUI();
+        
+        // 摄像机复位
+        camera.position.set(0, 10, 10);
+        controls.reset();
+    }
+
+    // 事件监听
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    
+    // 电脑点击
+    window.addEventListener('mousedown', onInteract);
+    // 手机触摸 (防止自带的缩放手势冲突，这里做简单处理)
+    window.addEventListener('touchstart', (e) => {
+        // 只有单指点击才触发下棋逻辑，双指留给OrbitControls缩放
+        if(e.touches.length === 1) {
+             // e.preventDefault(); // 如果你想完全接管触摸，取消注释这行，但会导致无法缩放
+             onInteract(e);
+        }
+    }, {passive: false});
+
+    // 渲染循环
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+    animate();
+
+</script>
+</body>
+</html>
